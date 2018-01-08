@@ -69,7 +69,7 @@ class Orchestrator(object):
 	LOG_LEVEL_INFO='info'
 	LOG_LEVEL_DEBUG='debug'
 
-	def __init__(self, partitionTargetValue, loglevel, dynamoDBRegion, scalingProfile, dryRun=False):
+	def __init__(self, partitionTargetValue, dynamoDBRegion, scalingProfile, dryRun=False):
 
 
 		# default to us-west-2
@@ -80,7 +80,6 @@ class Orchestrator(object):
 		self.dryRunFlag=dryRun
 	
 		self.partitionTargetValue=partitionTargetValue  # must be set prior to invoking initlogging()
-		self.loglevel=loglevel
 	
 		###
 		# DynamoDB Table Related
@@ -148,7 +147,6 @@ class Orchestrator(object):
 
 		# Get the SNS Topic
 		self.snsNotConfigured=False
-		self.sns_publisher = Utils.Snspublisher(self.workloadRegion)
 
 		self.startTime=0
 		self.finishTime=0
@@ -177,7 +175,7 @@ class Orchestrator(object):
 	def initializeState(self):
 
 		# Maximum number of retries for API calls
-		self.max_api_request=8
+		self.max_api_request=4
 
 		# Log the duration of the processing
 		self.startTime = datetime.datetime.now().replace(microsecond=0)
@@ -486,7 +484,7 @@ class Orchestrator(object):
 						subjectPrefix = "MaxRetries Exceeded Describeinstances"
 						theMessage = "Maximum API Call Retries for lookupInstancesByFilter() reached, exiting program"
 						try:
-							Utils.publishSNSTopicMessage(subjectPrefix, theMessage)
+							self.snsInit.publishTopicMessage(subjectPrefix, msg)
 		                                        logger.info('Sending SNS notification for Max Retries RateLimitExceeded - DescribeInstances')
 						except Exception as e:
 							logger.warning('Orchestrator::publishSNSTopicMessage() encountered an exception of -->' + str(e))
@@ -508,7 +506,7 @@ class Orchestrator(object):
 			if (count > 3):
 				try:			
 					subjectPrefix = "Scheduler Throttling detected"
-	        	                snsInit.publishSNSTopicMessage(subjectPrefix, msg)
+	        	                self.snsInit.publishTopicMessage(subjectPrefix, msg)
 					logger.info('Sending SNS notification for Throttling')
 				except Exception as e:
 					msg = 'sending SNS message failed with error -->'
@@ -543,10 +541,6 @@ class Orchestrator(object):
 		3) Log
 		'''
 
-#		Utils.makeSNSTopic()
-
-		self.sns_publisher.makeTopic(self.workloadSpecificationDict[Orchestrator.WORKLOAD_SNS_TOPIC_NAME])
-		
 
 		killSwitch = self.isKillSwitch()
 
@@ -625,7 +619,7 @@ class Orchestrator(object):
 		self.workloadSpecificationDictPass = self.workloadSpecificationDict[Orchestrator.WORKLOAD_SNS_TOPIC_NAME]
 
 		for currInstance in instancesToStopList:
-			stopWorker = StopWorker(self.dynamoDBRegion, self.workloadRegion, self.snsNotConfigured, currInstance, self.partitionTargetValue,self.workloadSpecificationDictPass,self.loglevel,self.dryRunFlag)
+			stopWorker = StopWorker(self.dynamoDBRegion, self.workloadRegion, self.snsNotConfigured, currInstance, self.dryRunFlag,self.exponentialBackoff,self.max_api_request,self.snsInit)
 			stopWorker.setWaitFlag(tierSynchronized)
 			stopWorker.execute(
 				self.workloadSpecificationDict[Orchestrator.WORKLOAD_SSM_S3_BUCKET_NAME],
@@ -669,7 +663,7 @@ class Orchestrator(object):
 
 		for currInstance in instancesToStartList:
 			logger.debug('Starting instance %s', currInstance)
-			startWorker = StartWorker(self.dynamoDBRegion, self.workloadRegion, self.snsNotConfigured, currInstance, self.all_elbs, self.elb, self.scaleInstanceDelay, self.dryRunFlag, self.exponentialBackoff, self.max_api_request,loglevel,self.partitionTargetValue,self.workloadSpecificationDictPass)
+			startWorker = StartWorker(self.dynamoDBRegion, self.workloadRegion, self.snsNotConfigured, currInstance, self.all_elbs, self.elb, self.scaleInstanceDelay, self.dryRunFlag, self.exponentialBackoff, self.max_api_request,self.snsInit)
 
 			# If a ScalingProfile was specified, change the instance type now, prior to Start
 			instanceTypeToLaunch = self.isScalingAction(tierName)
@@ -731,6 +725,11 @@ class Orchestrator(object):
 		logger.info('\n### Orchestrating STOP Action ###')
 		self.orchestrate(Orchestrator.ACTION_STOP )
 
+	def sns_init(self):
+		sns_topic_name = self.workloadSpecificationDict[Orchestrator.WORKLOAD_SNS_TOPIC_NAME]
+		sns_workload = self.workloadSpecificationDict[Orchestrator.WORKLOAD_SPEC_PARTITION_KEY]
+		self.snsInit = Utils.Snspublisher(self.workloadRegion,sns_workload)
+		self.snsInit.makeTopic(sns_topic_name)
 
 if __name__ == "__main__":
 	# python Orchestrator.py -i workloadIdentier -r us-west-2
@@ -760,7 +759,7 @@ if __name__ == "__main__":
 
 	Utils.initLogging(args.loglevel,args.workloadIdentifier)
 
-	orchMain = Orchestrator(args.workloadIdentifier, loglevel, args.dynamoDBRegion, args.scalingProfile, dryRun)
+	orchMain = Orchestrator(args.workloadIdentifier, args.dynamoDBRegion, args.scalingProfile, dryRun)
 
 
 	# If testcases set, run them, otherwise run the supplied Action only
@@ -776,6 +775,7 @@ if __name__ == "__main__":
 
 		logger.info('\n### Orchestrating %s' % action +' Action ###')
 		orchMain.initializeState()
+		orchMain.sns_init()
 		orchMain.orchestrate(action)
 
 	

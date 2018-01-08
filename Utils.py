@@ -6,20 +6,21 @@ import logging.handlers
 logger = logging.getLogger('Orchestrator') #The Module Name
 
 class Snspublisher():
-	def __init__(self,dynamoDBRegion):
+	def __init__(self,dynamoDBRegion,sns_workload):
 		self.dynamoDBRegion=dynamoDBRegion
 		self.snsTopicR = boto3.resource('sns', region_name=self.dynamoDBRegion)
 		snsTopic = ''
 		snsNotConfigured=False
-
-	def makeTopic(self,workloadSpecificationDict):
-			self.workloadSpecificationDict=workloadSpecificationDict
-        	        if (self.workloadSpecificationDict):
+		self.sns_workload = sns_workload
+			
+	def makeTopic(self,sns_topic_name):
+			self.sns_topic_name=sns_topic_name
+        	        if (self.sns_topic_name):
 
                 	        # Make or retrieve the SNS Topic setup.  Method is Idempotent
                         	try:
-                                	snsTopic = self.snsTopicR.create_topic( Name=self.workloadSpecificationDict)
-	                                snsTopicSubjectLine = self.makeTopicSubjectLine(self.workloadSpecificationDict)
+                                	self.snsTopic = self.snsTopicR.create_topic( Name=self.sns_topic_name)
+	                                self.snsTopicSubjectLine = self.makeTopicSubjectLine(self.sns_topic_name)
 
         	                except Exception as e:
                 	                logger.error('orchestrate() - creating SNS Topic ' + str(e) )
@@ -27,7 +28,7 @@ class Snspublisher():
 	                else:
         	                snsNotConfigured=True
 
-	def publishTopicMessage(subjectPrefix, theMessage):
+	def publishTopicMessage(self,subjectPrefix, theMessage):
         	        tagsMsg=''
                 	try:
 	                    	self.snsTopic.publish(
