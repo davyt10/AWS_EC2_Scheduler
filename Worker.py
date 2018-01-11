@@ -17,12 +17,11 @@ class Worker(object):
     SNS_SUBJECT_PREFIX_WARNING="Warning:"
     SNS_SUBJECT_PREFIX_INFORMATIONAL="Info:"
 
-    def __init__(self, workloadRegion, snsNotConfigured, instance, snsInit,dryRunFlag):
+    def __init__(self, workloadRegion, instance, snsInit,dryRunFlag):
 
         self.workloadRegion=workloadRegion
         self.instance=instance
         self.dryRunFlag=dryRunFlag
-        self.snsNotConfigured = snsNotConfigured
         self.snsInit = snsInit
         self.instanceStateMap = {
             "pending" : 0,
@@ -42,14 +41,13 @@ class Worker(object):
 
 class StartWorker(Worker):
 
-    def __init__(self, ddbRegion, workloadRegion, snsNotConfigured, instance, all_elbs, elb, scalingInstanceDelay, dryRunFlag, exponentialBackoff, max_api_request, snsInit):
-        super(StartWorker, self).__init__(workloadRegion, snsNotConfigured, instance,snsInit,dryRunFlag)
+    def __init__(self, ddbRegion, workloadRegion, instance, all_elbs, elb, scalingInstanceDelay, dryRunFlag, max_api_request, snsInit):
+        super(StartWorker, self).__init__(workloadRegion, instance,snsInit,dryRunFlag)
 
         self.ddbRegion=ddbRegion
         self.all_elbs=all_elbs
         self.elb=elb
         self.scalingInstanceDelay = scalingInstanceDelay
-        self.exponentialBackoff=exponentialBackoff
         self.max_api_request=max_api_request
 
     def addressELBRegistration(self):
@@ -63,28 +61,15 @@ class StartWorker(Worker):
                     elb_api_retry_count=1
                     while (success_deregister_done == 0):
                         try:
-
                             self.elb.deregister_instances_from_load_balancer(LoadBalancerName=elb_name,Instances=[{'InstanceId': self.instance.id}])
                             logger.debug("Succesfully deregistered instance %s from load balancer %s" % (self.instance.id, elb_name))
                             success_deregister_done=1
                         except Exception as e:
-                            logger.warning("Could not deregistered instance %s from load balancer %s" % (self.instance.id, elb_name))
                             logger.warning('Worker::addressELBRegistration()::deregister_instances_from_load_balancer() encountered an exception of -->' + str(e))
-                            if (elb_api_retry_count > self.max_api_request):
-                                msg = 'Maximum API Call Retries for addressELBRegistration: deregister() reached, exiting program'
-                                logger.error(msg + str(elb_api_retry_count))
-                                subjectPrefix = "MaxRetries Exceeded ELB"
-                                try:
-	                                self.snsInit.publishTopicMessage(subjectPrefix, msg)
-					logger.info('Sending SNS notification for Max Retries RateLimitExceeded - ELB')
-                                except Exception as e:
-					logger.warning('Worker::instance.start() encountered an exception of -->' + str(e))
-                                exit()
-                            else:
-				elb_api_retry_count+=1
-                                logger.warning('Exponential Backoff in progress, retry count = %s' % str(elb_api_retry_count))
-				msg = "Exponential Backoff in progress for EC2 instance %s, sleeping %s seconds" % (self.instance,elb_api_retry_count)
-                                self.exponentialBackoff(elb_api_retry_count,msg)
+			    subject_prefix = "Scheduler exception - deregister ELB"
+			    msg = "Exponential Backoff in progress for deregister_instances_from_load_balancer - EC2 instance %s, sleeping %s seconds" % (self.instance,elb_api_retry_count)
+			    self.snsInit.exponentialBackoff(elb_api_retry_count,msg,subject_prefix)
+			    elb_api_retry_count+=1
 
                     success_register_done=0
                     elb_api_retry_count=1
@@ -93,27 +78,13 @@ class StartWorker(Worker):
                             self.elb.register_instances_with_load_balancer(LoadBalancerName=elb_name, Instances=[{'InstanceId': self.instance.id}])
                             logger.debug('Succesfully registered instance %s to load balancer %s' % (self.instance.id, elb_name))
                             success_register_done=1
-                            # self.warningMsg = "ELB Registered for instance"
-                            # self.publishSNSTopicMessage(self.warningMsg, self.warningMsg, self.instance)
-                        except botocore.exceptions.ClientError as e:
-                            logger.warning('Could not register instance [%s] to load balancer [%s] because of [%s]' % (self.instance.id, elb_name, str(e)))
-                            logger.warning('Worker::addressELBRegistration()::register_instances_with_load_balancer() encountered an exception of -->' + str(e))
-                            if (elb_api_retry_count > self.max_api_request):
-                                msg = 'Maximum API Call Retries for addressELBRegistration:register() reached, EC2 instance: %s. Exiting program' % self.instance
-                                logger.error(msg + str(elb_api_retry_count))
-                                subjectPrefix = "MaxRetries Exceeded ELB"
-                                try:
-                                        Orchestrator.publishSNSTopicMessage(subjectPrefix, msg)
-                                        logger.info('Sending SNS notification for Max Retries RateLimitExceeded - ELB')
-                                except Exception as e:
-                                        logger.warning('Worker::instance.start() encountered an exception of -->' + str(e))
-                                exit()
-                            else:
-				elb_api_retry_count+=1
-                                logger.warning('Exponential Backoff in progress, retry count = %s' % str(elb_api_retry_count))
-				msg = 'Exponential Backoff in progress, retry count = %s' % str(elb_api_retry_count) % self.instance
-                                self.exponentialBackoff(elb_api_retry_count,msg)
-                                
+			except Exception as e:
+			    logger.warning('Worker::addressELBRegistration()::register_instances_with_load_balancer() encountered an exception of -->' + str(e))
+                            msg = "Exponential Backoff in progress for register_instances_from_load_balancer - EC2 instance %s, sleeping %s seconds" % (self.instance,elb_api_retry_count)
+                            subject_prefix = "Scheduler exception - register ELB"
+                            self.snsInit.exponentialBackoff(elb_api_retry_count,msg,subject_prefix)
+                            elb_api_retry_count+=1
+
 
 
     def startInstance(self):
@@ -123,44 +94,23 @@ class StartWorker(Worker):
             logger.warning('DryRun Flag is set - instance will not be started')
         else:
             if self.all_elbs != "0":
-                    logger.debug('addressELBRegistration() for %s' % self.instance.id)
-                    self.addressELBRegistration()
-            try:
-                    ec2_instance_start = 0
-                    ec2_start_api_retry_count = 1
-                    while (ec2_instance_start == 0):
-                        logger.debug('Starting EC2 instance: %s' % self.instance.id)
-                        try:
+                logger.debug('addressELBRegistration() for %s' % self.instance.id)
+                self.addressELBRegistration()
+                ec2_instance_start = 0
+                ec2_start_api_retry_count = 1
+                while (ec2_instance_start == 0):
+                    logger.debug('Starting EC2 instance: %s' % self.instance.id)
+                    try:
                             result=self.instance.start()
                             ec2_instance_start = 1
                             logger.debug('Starting EC2 instance: %s' % self.instance.id)
                             logger.info('startInstance() for ' + self.instance.id + ' result is %s' % result)
-                        except Exception as e:
-                            msg = 'Worker::instance.start() Exception encountered during instance start'
-                            logger.error(msg)
-                            if (ec2_start_api_retry_count > self.max_api_request):
-                                logger.error(
-                                    'Maximum API Call Retries for instance.start() reached, exiting program')
-                                subjectPrefix = "MaxRetries Exceeded InstanceStart"
-                                msg = "Maximum API Call Retries for InstanceStart() reached, exiting program"
-                                try:
-                                    self.snsInit.publishSNSTopicMessage(subjectPrefix, msg)
-                                    logger.info(
-                                        'Sending SNS notification for Max Retries RateLimitExceeded - StartInstance')
-                                except Exception as e:
-                                    logger.warning(
-                                        'Orchestrator::publishSNSTopicMessage() encountered an exception of -->' + str(
-                                            e))
-                                exit()
-                            else:
-                                logger.warning(
-                                    'Exponential Backoff in progress, retry count = %s' % str(ec2_start_api_retry_count))
-                                theMessage = "Exponential Backoff in progress for lookupInstancesByFilter()"
-                                self.exponentialBackoff(ec2_start_api_retry_count, theMessage)
-                                ec2_start_api_retry_count += 1
-
-            except Exception as e:
-                logger.warning('Worker::instance.start() encountered an exception of -->' + str(e))
+                    except Exception as e:
+                        msg = 'Worker::instance.start() Exception encountered during instance start ---> %s' % e
+                        subject_prefix = "Scheduler exception - EC2 instance start"
+                        logger.error(msg)
+                        self.snsInit.exponentialBackoff(ec2_start_api_retry_count,msg,subject_prefix)
+                        ec2_start_api_retry_count += 1
 
     def scaleInstance(self, modifiedInstanceType):
 
@@ -196,24 +146,12 @@ class StartWorker(Worker):
                         )
                         instance_type_done=1
                     except Exception as e:
-                        logger.warning('Worker::instance.modify_attribute() encountered an exception where requested instance type ['+ modifiedInstanceType +'] resulted in -->' + str(e))
-                        if (scale_api_retry_count > self.max_api_request):
-                            msg = 'Maximum Retries RateLimitExceeded reached for modifiedInstanceType , stopping process at number of retries--> %s ' % self.max_api_request
-                            logger.error(msg)
-                            subjectPrefix = "MaxRetries Exceeded Instance Modify"
-                            try:
-                                        Orchestrator.publishSNSTopicMessage(subjectPrefix, msg, self.instance)
-                                        logger.info('Sending SNS notification for Max Retries RateLimitExceeded - Instance Modify')
-                            except Exception as e:
-                                        logger.warning('Worker::instance.start() encountered an exception of -->' + str(e))
+			msg = 'Worker::instance.modify_attribute().modifiedInstanceType Exponential Backoff in progress for EC2 instance %s, retry count %s, error --> %s ' % (self.instance,scale_api_retry_count,str(e))
+			subject_prefix = "Scheduler exception ec2.modify_attribute"
+			logger.warning(msg)
+			self.snsInit.exponentialBackoff(scale_api_retry_count,msg,subject_prefix)
+			scale_api_retry_count += 1
 
-                            exit()
-                        else:
-			    scale_api_retry_count += 1
-                            logger.warning('Exponential Backoff in progress, retry count = %s' % str(scale_api_retry_count))
-				
-                            self.exponentialBackoff(scale_api_retry_count,self.publishSNSTopicMessage,self.instance)
-		
                 ebs_optimized_done=0
                 ebs_optimized_retry_count=1
                 while(ebs_optimized_done == 0):
@@ -225,22 +163,11 @@ class StartWorker(Worker):
                         )
                         ebs_optimized_done=1
                     except Exception as e:
-                        logger.warning('Worker::instance.modify_attribute() encountered an exception where requested EBS optimized flag set to ['+ str(ebsOptimizedAttr) +'] resulted in -->' + str(e))
-                        if (ebs_optimized_retry_count > self.max_api_request):
-                            msg = 'Maximum Retries RateLimitExceeded reached for ebsOptimizedAttr, stopping process at number of retries--> %s ' % self.max_api_request
-                            logger.error(msg)
-                            subjectPrefix = "MaxRetries Exceeded EBS Modify"
-                            try:
-					self.snsInit.publishTopicMessage(subjectPrefix, msg)
-                                        logger.info('Sending SNS notification for Max Retries RateLimitExceeded - EBS Modify')
-                            except Exception as e:
-                                        logger.warning('Worker::instance.start() encountered an exception of -->' + str(e))
-                            exit()
-                        else:
-			    msg = 'Exponential Backoff in progress, retry count = %s, EC2 instance %s' % (ebs_optimized_retry_count,self.instance)
-                            logger.warning('Exponential Backoff in progress, retry count = %s' % str(ebs_optimized_retry_count))
-                            self.exponentialBackoff(ebs_optimized_retry_count,msg)
-			    ebs_optimized_retry_count += 1
+			msg = 'Worker::instance.modify_attribute().ebsOptimizedAttr Exponential Backoff in progress for EC2 instance %s, retry count = %s, error --> %s' % (self.instance,ebs_optimized_retry_count,str(e))
+		        logger.warning(msg)	
+			subject_prefix = "Scheduler exception EC2 modify_attribute"
+			self.snsInit.exponentialBackoff(ebs_optimized_retry_count,msg,subject_prefix)
+			ebs_optimized_retry_count += 1
 
                     # It appears the start instance reads 'modify_attribute' changes as eventually consistent in AWS (assume DynamoDB),
                     #    this can cause an issue on instance type change, whereby the LaunchPlan generates an exception.
@@ -256,8 +183,8 @@ class StartWorker(Worker):
         self.startInstance()
 
 class StopWorker(Worker):
-    def __init__(self, ddbRegion, workloadRegion, snsNotConfigured, instance, dryRunFlag,exponentialBackoff,max_api_request,snsInit):
-        super(StopWorker, self).__init__(workloadRegion, snsNotConfigured, instance, snsInit,dryRunFlag)
+    def __init__(self, ddbRegion, workloadRegion, instance, dryRunFlag,max_api_request,snsInit):
+        super(StopWorker, self).__init__(workloadRegion, instance, snsInit,dryRunFlag)
 
         self.ddbRegion=ddbRegion
 
@@ -265,7 +192,6 @@ class StopWorker(Worker):
         self.waitFlag=strtobool('False')
         self.overrideFlag=strtobool('False')
 	self.max_api_request=max_api_request
-	self.exponentialBackoff=exponentialBackoff
 	self.snsInit=snsInit
     def stopInstance(self):
 
@@ -286,22 +212,11 @@ class StopWorker(Worker):
 		        logger.info('stopInstance() for ' + self.instance.id + ' result is %s' % result)
 		        success_instance_stop = 1
                 except Exception as e:
-                        logger.warning('Worker:: instance.stop() encountered an exception of -->' + str(e))
-		        if (stop_instance_api_retry_count > self.max_api_request):
-		                msg = 'Maximum API Call Retries for instance.stop() reached, exiting program'
-		                logger.error(msg + str(stop_instance_api_retry_count))
-		                subjectPrefix = "MaxRetries Exceeded StopInstance"
-                        	try:
-			    		self.snsInit.publishTopicMessage(subjectPrefix, msg)
-                            		logger.info('Sending SNS notification for Max Retries RateLimitExceeded - StopInstances')
-		        	except Exception as e:
-                            		logger.warning('Worker::instance.stop() encountered an exception of -->' + str(e))
-		        	exit()
-                        else:
-		                    msg = 'Exponential Backoff in progress, retry count = %s, EC2 instance %s' % (stop_instance_api_retry_count,self.instance.id)
-		                    logger.warning('Exponential Backoff in progress for StopInstances(), retry count = %s, EC2 instance = %s' % (stop_instance_api_retry_count, str(self.instance.id)))
-		                    self.exponentialBackoff(stop_instance_api_retry_count,msg)
-		                    stop_instance_api_retry_count += 1
+			msg = 'Worker::instance.stop() Exponential Backoff in progress for EC2 instance %s, retry count = %s, error --> %s' % (self.instance,stop_instance_api_retry_count,str(e))
+                        logger.warning(msg)
+			subject_prefix = "Scheduler exception - instance.stop"
+			self.snsInit.exponentialBackoff(stop_instance_api_retry_count,msg,subject_prefix)
+		        stop_instance_api_retry_count += 1
 
 
         # If configured, wait for the stop to complete prior to returning
@@ -414,12 +329,11 @@ class StopWorker(Worker):
             warningMsg=Worker.SNS_SUBJECT_PREFIX_WARNING + ' SSM will not be executed as S3 bucket is not in the same region as the workload. [' + self.instance.id + '] Instance will be not be stopped'
             logger.warning(warningMsg)
 
-        if( self.snsNotConfigured == False ):
-            if( self.overrideFlag == True ):
-                if( warningMsg ):
-                    self.publishSNSTopicMessage(Worker.SNS_SUBJECT_PREFIX_WARNING, warningMsg, self.instance)
-                else:
-                    self.publishSNSTopicMessage(Worker.SNS_SUBJECT_PREFIX_INFORMATIONAL, msg, self.instance)
+        if( self.overrideFlag == True ):
+            if( warningMsg ):
+                self.snsInit.publishTopicMessage(Worker.SNS_SUBJECT_PREFIX_WARNING, warningMsg)
+            else:
+                self.snsInit.publishTopicMessage(Worker.SNS_SUBJECT_PREFIX_INFORMATIONAL, msg)
 
         return( self.overrideFlag )
 

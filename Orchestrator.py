@@ -11,6 +11,7 @@ from distutils.util import strtobool
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Key, Attr
 from Worker import Worker, StopWorker, StartWorker
+from Utils import RetryNotifier
 
 __author__ = "Gary Silverman"
 
@@ -145,9 +146,6 @@ class Orchestrator(object):
 		#
 		###
 
-		# Get the SNS Topic
-		self.snsNotConfigured=False
-
 		self.startTime=0
 		self.finishTime=0
 
@@ -175,7 +173,7 @@ class Orchestrator(object):
 	def initializeState(self):
 
 		# Maximum number of retries for API calls
-		self.max_api_request=4
+		self.max_api_request=8
 
 		# Log the duration of the processing
 		self.startTime = datetime.datetime.now().replace(microsecond=0)
@@ -185,8 +183,10 @@ class Orchestrator(object):
 
 		# The region where the workload is running.  Note: this may be a different region than the 
 		# DynamodDB configuration
-		self.workloadRegion = self.workloadSpecificationDict[Orchestrator.WORKLOAD_SPEC_REGION_KEY]
-
+		try:
+			self.workloadRegion = self.workloadSpecificationDict[Orchestrator.WORKLOAD_SPEC_REGION_KEY]
+		except Exception as e:
+			logger.warning('Orchestrator.py::initializeState() Error obtaining self.workloadRegion --> %s' % str(e))
 		# The delay (in seconds) when scaling an instance type ahead of Starting the newly scaled instance.
 		# This is needed due to an eventual consistency issue in AWS whereby Instance.modifyAttribute() is changed
 		# and Instance.startInstance() experiences an Exception because the modifyAttribute() has not fully propogated.
@@ -212,15 +212,25 @@ class Orchestrator(object):
 			msg = 'Orchestrator::__init__() Exception obtaining botot3 elb client in region %s -->' % self.workloadRegion
 			logger.error(msg + str(e))
 
-		try:
-			self.all_elbs = self.elb.describe_load_balancers()
-			msg = 'Orchestrator::__init() Found attached ELBs-->'
-		except Exception as e:
-			self.all_elbs = "0"
-			msg = 'Orchestrator:: Exception obtaining all ELBs in region %s -->' % self.workloadRegion
-			logger.error(msg + str(e))
 		# Grab tier specific workload information from DynamoDB
-		self.lookupTierSpecs(self.partitionTargetValue)
+                self.lookupTierSpecs(self.partitionTargetValue)
+
+	def lookupELBs(self):
+
+		success_describe_elbs_done = 0
+                describe_elb_api_retry_count = 1
+		while (success_describe_elbs_done == 0):
+			try:
+				self.all_elbs = self.elb.describe_load_balancers()
+				msg = 'Orchestrator::__init() Found attached ELBs-->'
+				success_describe_elbs_done = 1
+			except Exception as e:
+				self.all_elbs = "0"
+				msg = 'Orchestrator:: Exception obtaining all ELBs in region %s --> %s' % (self.workloadRegion,e)
+				subject_prefix = "Scheduler Exception in %s" % self.workloadRegion
+				logger.error(msg + str(e))
+				self.snsInit.exponentialBackoff(describe_elb_api_retry_count,msg,subject_prefix)
+				describe_elb_api_retry_count += 1
 
 	def lookupWorkloadSpecification(self, partitionTargetValue):
 		try:
@@ -467,7 +477,7 @@ class Orchestrator(object):
 		# NOTE: Only instances within the specified region are returned
 		targetInstanceColl = {}
 		instances_filter_done=0
-		api_retry_count=1
+		filter_instances_api_retry_count=1
 		while (instances_filter_done==0):
 				try:	
 					targetInstanceColl = self.ec2R.instances.filter(Filters=targetFilter)
@@ -479,46 +489,13 @@ class Orchestrator(object):
 				except Exception as e:
 					msg = 'Orchestrator::lookupInstancesByFilter() Exception encountered during instance filtering %s -->'
 					logger.error(msg + str(e))
-					if (api_retry_count > self.max_api_request ):
-						logger.error('Maximum API Call Retries for lookupInstancesByFilter() reached, exiting program')
-						subjectPrefix = "MaxRetries Exceeded Describeinstances"
-						theMessage = "Maximum API Call Retries for lookupInstancesByFilter() reached, exiting program"
-						try:
-							self.snsInit.publishTopicMessage(subjectPrefix, msg)
-		                                        logger.info('Sending SNS notification for Max Retries RateLimitExceeded - DescribeInstances')
-						except Exception as e:
-							logger.warning('Orchestrator::publishSNSTopicMessage() encountered an exception of -->' + str(e))
-						exit()
-					else:
-						logger.warning('Exponential Backoff in progress, retry count = %s' % str(api_retry_count))
-						theMessage = "Exponential Backoff in progress for lookupInstancesByFilter()"
-						self.exponentialBackoff(api_retry_count,theMessage)
-						api_retry_count += 1
+					subject_prefix = "Scheduler Exception in %s" % self.workloadRegion
+					self.snsInit.exponentialBackoff(filter_instances_api_retry_count,msg,subject_prefix)
+					filter_instances_api_retry_count += 1
 
 		return targetInstanceColl
 
-	def exponentialBackoff(self,count,msg):
-		try:
-			sleepTime = pow(float(2), float(count))
-			logger.info(msg + str(sleepTime))
-	
-			# This is to ensure that we are sending SNS notifications only after 3rd count
-			if (count > 3):
-				try:			
-					subjectPrefix = "Scheduler Throttling detected"
-	        	                self.snsInit.publishTopicMessage(subjectPrefix, msg)
-					logger.info('Sending SNS notification for Throttling')
-				except Exception as e:
-					msg = 'sending SNS message failed with error -->'
-		                        logger.error(msg + str(e))
-
-			time.sleep(sleepTime)
-
-		except Exception as e:
-			msg = 'exponentialBackoff failed with error %s -->'
-			logger.error(msg + str(e))
 			
-
 	def isKillSwitch(self):
 
 		res = False
@@ -564,7 +541,8 @@ class Orchestrator(object):
 					
 
 			elif( action == Orchestrator.ACTION_START ): 
-				
+				orchMain.lookupELBs()
+	
 				# Sequence the tiers per the START order
 				self.sequenceTiers(Orchestrator.TIER_START)
 				
@@ -616,10 +594,9 @@ class Orchestrator(object):
 		# Grab the EC2 region (not DynamodDB region) for the worker to make API calls
 		#region=self.workloadSpecificationDict[self.WORKLOAD_SPEC_REGION_KEY]
 
-		self.workloadSpecificationDictPass = self.workloadSpecificationDict[Orchestrator.WORKLOAD_SNS_TOPIC_NAME]
 
 		for currInstance in instancesToStopList:
-			stopWorker = StopWorker(self.dynamoDBRegion, self.workloadRegion, self.snsNotConfigured, currInstance, self.dryRunFlag,self.exponentialBackoff,self.max_api_request,self.snsInit)
+			stopWorker = StopWorker(self.dynamoDBRegion, self.workloadRegion, currInstance, self.dryRunFlag,self.max_api_request,self.snsInit)
 			stopWorker.setWaitFlag(tierSynchronized)
 			stopWorker.execute(
 				self.workloadSpecificationDict[Orchestrator.WORKLOAD_SSM_S3_BUCKET_NAME],
@@ -659,11 +636,10 @@ class Orchestrator(object):
 		#region=self.workloadSpecificationDict[self.WORKLOAD_SPEC_REGION_KEY]
 
 		logger.debug('In startATier() for %s', tierName)
-		self.workloadSpecificationDictPass = self.workloadSpecificationDict[Orchestrator.WORKLOAD_SNS_TOPIC_NAME]
 
 		for currInstance in instancesToStartList:
 			logger.debug('Starting instance %s', currInstance)
-			startWorker = StartWorker(self.dynamoDBRegion, self.workloadRegion, self.snsNotConfigured, currInstance, self.all_elbs, self.elb, self.scaleInstanceDelay, self.dryRunFlag, self.exponentialBackoff, self.max_api_request,self.snsInit)
+			startWorker = StartWorker(self.dynamoDBRegion, self.workloadRegion, currInstance, self.all_elbs, self.elb, self.scaleInstanceDelay, self.dryRunFlag, self.max_api_request,self.snsInit)
 
 			# If a ScalingProfile was specified, change the instance type now, prior to Start
 			instanceTypeToLaunch = self.isScalingAction(tierName)
@@ -726,10 +702,15 @@ class Orchestrator(object):
 		self.orchestrate(Orchestrator.ACTION_STOP )
 
 	def sns_init(self):
-		sns_topic_name = self.workloadSpecificationDict[Orchestrator.WORKLOAD_SNS_TOPIC_NAME]
-		sns_workload = self.workloadSpecificationDict[Orchestrator.WORKLOAD_SPEC_PARTITION_KEY]
-		self.snsInit = Utils.Snspublisher(self.workloadRegion,sns_workload)
-		self.snsInit.makeTopic(sns_topic_name)
+		try:
+			sns_topic_name = self.workloadSpecificationDict[Orchestrator.WORKLOAD_SNS_TOPIC_NAME]
+			sns_workload = self.workloadSpecificationDict[Orchestrator.WORKLOAD_SPEC_PARTITION_KEY]
+			self.snsInit = RetryNotifier(self.workloadRegion,sns_workload,self.max_api_request)
+			self.snsInit.makeTopic(sns_topic_name)
+#		else:
+		except Exception as e: 
+			logger.info('Orchestrator::sns_init() sns_topic_name must be defined in DynamoDB --> ' + str(e))
+			exit()
 
 if __name__ == "__main__":
 	# python Orchestrator.py -i workloadIdentier -r us-west-2
