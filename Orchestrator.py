@@ -6,6 +6,7 @@ import datetime
 import argparse
 import Utils
 import logging 
+import re
 
 from distutils.util import strtobool
 from botocore.exceptions import ClientError
@@ -64,6 +65,7 @@ class Orchestrator(object):
 
 	ACTION_STOP='Stop'
 	ACTION_START='Start'
+	FLEET_SUBSET='1'
 	# ACTION_SCALE_UP='ScaleUp'
 	# ACTION_SCALE_DOWN='ScaleDown'
 
@@ -110,7 +112,8 @@ class Orchestrator(object):
 			Orchestrator.WORKLOAD_SNS_TOPIC_NAME,
 			Orchestrator.WORKLOAD_KILL_SWITCH,
 			Orchestrator.WORKLOAD_SCALE_INSTANCE_DELAY,
-			Orchestrator.TIER_FILTER_TAG_KEY
+			Orchestrator.TIER_FILTER_TAG_KEY,
+			Orchestrator.FLEET_SUBSET
 		]
 
 		# Tier-specific DynamoDB Table Related
@@ -308,6 +311,9 @@ class Orchestrator(object):
 				if (Orchestrator.TIER_SCALING in currTier):
 					self.tierSpecDict[ currTier[Orchestrator.TIER_NAME] ].update( { Orchestrator.TIER_SCALING : currTier[ Orchestrator.TIER_SCALING ] } )
 
+				if (Orchestrator.FLEET_SUBSET in currTier):
+					self.tierSpecDict[ currtier[Orchestrator.TIER_NAME] ].update( { Orchestrator.FLEET_SUBSET : currTier[ Orchestrator.FLEET_SUBSET ] } )
+
 				#self.logSpecDict('lookupTierSpecs', currTier, Orchestrator.LOG_LEVEL_DEBUG )
 
 			# Log the constructed Tier Spec Dictionary
@@ -480,14 +486,14 @@ class Orchestrator(object):
 		filter_instances_api_retry_count=1
 		while (instances_filter_done==0):
 				try:	
-					targetInstanceColl = self.ec2R.instances.filter(Filters=targetFilter)
+					targetInstanceColl = sorted(self.ec2R.instances.filter(Filters=targetFilter))
 					logger.info('lookupInstancesByFilter(): # of instances found for tier %s in state %s is %i' % (tierName, targetInstanceStateKey, len(list(targetInstanceColl))))
 					if(logger.level==Orchestrator.LOG_LEVEL_DEBUG):
 						for curr in targetInstanceColl:
 							logger.debug('lookupInstancesByFilter(): Found the following matching targets %s' % curr)
 					instances_filter_done=1
 				except Exception as e:
-					msg = 'Orchestrator::lookupInstancesByFilter() Exception encountered during instance filtering %s -->'
+					msg = 'Orchestrator::lookupInstancesByFilter() Exception encountered during instance filtering %s -->' % e
 					logger.error(msg + str(e))
 					subject_prefix = "Scheduler Exception in %s" % self.workloadRegion
 					self.snsInit.exponentialBackoff(filter_instances_api_retry_count,msg,subject_prefix)
@@ -622,9 +628,19 @@ class Orchestrator(object):
 
 		stopped=self.instanceStateMap[80]
 
-		# Find the running instances of this tier to stop
+		# Find the stopped instances of this tier to start
 		instancesToStartList = self.lookupInstancesByFilter(
 			stopped,
+			tierName
+		)
+
+		# Find the running instances of this Tier required to analyze if we already have
+		# enough of the running instances
+
+		running=self.instanceStateMap[16]
+
+		runningInstancesList = self.lookupInstancesByFilter(
+			running,
 			tierName
 		)
 
@@ -637,23 +653,72 @@ class Orchestrator(object):
 
 		logger.debug('In startATier() for %s', tierName)
 
-		for currInstance in instancesToStartList:
-			logger.debug('Starting instance %s', currInstance)
-			startWorker = StartWorker(self.dynamoDBRegion, self.workloadRegion, currInstance, self.all_elbs, self.elb, self.scaleInstanceDelay, self.dryRunFlag, self.max_api_request,self.snsInit)
+		# number_of_instances is the output of isFleetSubset method
 
-			# If a ScalingProfile was specified, change the instance type now, prior to Start
-			instanceTypeToLaunch = self.isScalingAction(tierName)
-			if( instanceTypeToLaunch ):
-				startWorker.scaleInstance(instanceTypeToLaunch)
+		number_of_instances = self.isFleetSubset(tierName)
 
-			# Finally, have the worker Start the instance
-			startWorker.start()
+		if (number_of_instances is None ):
+			logger.debug('Orchestrator(): Fleet Subset profile not specified')
+			logger.info('Orchestrator(): Fleet Subset profile not specified')
 
-		# Delay to be introduced prior to allowing the next tier to be actioned.
-		# It may make sense to allow some amount of time for the instances to Stop, prior to Orchestration continuing.
-		time.sleep(self.getInterTierOrchestrationDelay(tierName, Orchestrator.TIER_START))
+		else:
+			if re.search("%",number_of_instances):
+				split_number = number_of_instances.split("%")[0]
+				if (int(split_number) <= 0) or (int(split_number) > 100):
+					number_of_instances = "default"
+				else:
+					number_of_instances = int(round(int(split_number) * len(list(instancesToStartList)) / 100.0))
 
-		logger.debug('startATier() completed for tier %s' % tierName)
+		# We are checking if there is "default" ScalingTier (which is the same as None actually), or if number of desired instances is higher than current number of instances
+		
+		if (number_of_instances is None ) or (number_of_instances == "default") or (int(number_of_instances) > len(list(instancesToStartList))):
+			for currInstance in instancesToStartList:
+				logger.debug('Number of desired instances in FleetSubset higher than number of existing EC2 instances or no FleetSubset Profile present; Will start all EC2 instances within Tier. Starting instance %s', currInstance)
+                                logger.info('Number of desired EC2 instances in FleetSubset higher than number of existing EC2 instances or no FleetSubset Profile present; Will start all EC2 instances within Tier. Starting instance %s', currInstance)
+				startWorker = StartWorker(self.dynamoDBRegion, self.workloadRegion, currInstance, self.all_elbs, self.elb, self.scaleInstanceDelay, self.dryRunFlag, self.max_api_request,self.snsInit)
+
+				# If a ScalingProfile was specified, change the instance type now, prior to Start
+				instanceTypeToLaunch = self.isScalingAction(tierName)
+				if( instanceTypeToLaunch ):
+					startWorker.scaleInstance(instanceTypeToLaunch)
+
+				# Finally, have the worker Start the instance
+				startWorker.start()
+
+			# Delay to be introduced prior to allowing the next tier to be actioned.
+			# It may make sense to allow some amount of time for the instances to Stop, prior to Orchestration continuing.
+			time.sleep(self.getInterTierOrchestrationDelay(tierName, Orchestrator.TIER_START))
+
+			logger.debug('startATier() completed for tier %s' % tierName)
+
+		elif (int(number_of_instances) == 0):
+			logger.debug('Number of desired instances in Tier %s has been chosen to 0, not starting any EC2 instances' % tierName)
+			logger.info('Number of desired instances in Tier %s has been chosen to 0, not starting any EC2 instances' % tierName)
+
+		elif (len(runningInstancesList) >= int(number_of_instances)):
+			logger.debug('Number of desired instances already reached: %s' % len(runningInstancesList))
+			logger.info('Number of desired instances already reached: %s' % len(runningInstancesList))
+		else:
+			logger.info('Orchestrator(): FleetSubset defined, starting %s subset of EC2 instances' % number_of_instances)
+			Counter = 1
+			for currInstance in instancesToStartList:
+				logger.debug('Starting instance %s', currInstance)
+				startWorker = StartWorker(self.dynamoDBRegion, self.workloadRegion, currInstance, self.all_elbs, self.elb, self.scaleInstanceDelay, self.dryRunFlag, self.max_api_request,self.snsInit)
+				# If a ScalingProfile was specified, change the instance type now, prior to Start
+				instanceTypeToLaunch = self.isScalingAction(tierName)
+				if( instanceTypeToLaunch ):
+					startWorker.scaleInstance(instanceTypeToLaunch)
+
+				# Finally, have the worker Start the instance
+				startWorker.start()				
+				if (Counter == int(number_of_instances)):
+					logger.debug('Number of instances reached desired number')
+					logger.info('Number of instances reached desired number')
+					break
+				else:
+					logger.debug('Counter: %s, Desired number: %s, Current total number: %s' % (Counter,number_of_instances,len(list(instancesToStartList))))
+					logger.info('Counter: %s, Desired number: %s, Current total number: %s' % (Counter,number_of_instances,len(list(instancesToStartList))))
+				Counter += 1
 
 	def isScalingAction(self, tierName):
 
@@ -671,7 +736,8 @@ class Orchestrator(object):
 				# Ok, so next, does this tier have a Scaling Profile?
 				if( self.scalingProfile in scalingDict ):
 					# Ok, so then what is the EC2 InstanceType to launch with, for the given ScalingProfile specified ?
-					instanceType = scalingDict[self.scalingProfile]
+					instanceType = scalingDict[self.scalingProfile]['InstanceType']
+					logger.info('Orchestrator().isScalingAction(): Chosen ScalingProfile: %s, Instance Type: %s' % (str(instanceType), str(self.scalingProfile)))
 					return instanceType
 				else:
 					logger.warning('Scaling Profile of [%s] not in tier [%s] ' % (str(self.scalingProfile), tierName ) )
@@ -680,6 +746,29 @@ class Orchestrator(object):
 				logger.warning('Scaling Profile of [%s] specified but no TierScaling dictionary found in DynamoDB for tier [%s].  No scaling action taken' % (str(self.scalingProfile), tierName) )
 
 		return( None )
+	
+	def isFleetSubset(self, tierName):
+		if(self.scalingProfile):
+			logger.debug('scalingProfile requested - FleetSubset calculator')
+			
+			# Unpack the ScalingDictionary
+			tierAttributes = self.tierSpecDict[tierName]
+			if( Orchestrator.TIER_SCALING in tierAttributes):
+
+				scalingDict = tierAttributes[ Orchestrator.TIER_SCALING ]
+				logger.debug('FleetSubset for Tier %s %s ' % (tierName, str(scalingDict) ))
+
+				if ( self.scalingProfile in scalingDict ):
+					if 'FleetSubset' in scalingDict[self.scalingProfile]:
+						fleet_number = scalingDict[self.scalingProfile]['FleetSubset']
+					else:
+						fleet_number = "default"
+
+					return fleet_number
+				else:
+					logger.warning('FleetSubset of [%s] not in tier [%s] ' % (str(self.scalingProfile), tierName ) )
+			else:
+				logger.warning('FleetSubset Profile of [%s] specified but no FleetSubset dictionary found in DynamoDB for tier [%s]. No action taken' % (str(self.scalingProfile), tierName) )
 
 	def runTestCases(self):
 		logger.info('Executing runTestCases()')
