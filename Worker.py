@@ -186,14 +186,14 @@ class StartWorker(Worker):
             logger.warning(logMsg)
 
     def t2Unlimited(self,modifiedInstanceList):
-	
+
 	if len(modifiedInstanceList) == 3:
 		self.modifiedInstanceFlag = modifiedInstanceList[2]
 		logger.info('t2Unlimited(): Checking if T2 Unlimited flag is specified in DynamoDB')
 		logger.debug('t2Unlimited(): t2_unlimited_flag: %s' % self.modifiedInstanceFlag )
 		if ( self.modifiedInstanceFlag == "u") or ( self.modifiedInstanceFlag == "U"):
 		    logger.debug('t2Unlimited(): Found T2 Flag in DynamoDB: %s' % self.modifiedInstanceFlag )
-		    self.check_t2_unlimited()
+		    self.checkT2Unlimited()
 		    if self.current_t2_value == "standard":
 			t2_unlimited_done=0
 			t2_unlimited_retry_count=1
@@ -217,7 +217,7 @@ class StartWorker(Worker):
 				self.snsInit.exponentialBackoff(t2_unlimited_retry_count,msg,subject_prefix)
 				t2_unlimited_retry_count += 1
 	else:
-		self.check_t2_unlimited()
+		self.checkT2Unlimited()
 		if self.current_t2_value == "unlimited":
 	        	logger.debug('t2Unlimited(): Current T2 value: %s' % self.current_t2_value)
 			t2_standard_done=0
@@ -241,7 +241,7 @@ class StartWorker(Worker):
 				subject_prefix = "Exception EC2 T2 unlimited"
 				self.snsInit.exponentialBackoff(t2_standard_retry_count,msg,subject_prefix)
 				t2_standard_retry_count += 1
-    def check_t2_unlimited(self):
+    def checkT2Unlimited(self):
 	t2_standard_check_done=0
 	t2_standard_check_retry_count=1
 	while(t2_standard_check_done == 0):
